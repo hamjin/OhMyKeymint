@@ -37,11 +37,16 @@
 
 ### OMK Routing
 
-- For every request routed by `scoop` with `FilterDecision::allowed == true`, OMK is the only
+- SELINUX and BLOB primary namespaces are outside OMK interception and must pass to System
+  unchanged, including through synthetic security-level handles. A secondary attestation or
+  wrapping key does not change an APP request's backend. Namespace migration involving SELINUX
+  or BLOB stays on System; these namespaces are not mirrored into OMK.
+- For every in-scope request routed by `scoop` with `FilterDecision::allowed == true`, OMK is the only
   backend during normal reachable operation. Per-method intercept settings still determine whether
   a request is routed by `scoop`.
-- Choose the backend only from the current caller, filter decision, method, and configuration. Do
-  not read or infer which backend created a key, `KeyDescriptor`, `KEY_ID`, `GRANT`, alias,
+- Apart from the fixed primary-namespace boundary, choose the backend only from the current
+  caller, filter decision, method, and configuration. Do not read or infer which backend created
+  a key, `KeyDescriptor`, `KEY_ID`, `GRANT`, alias,
   wrapping key, or attestation key.
 - Per-method intercept settings are authoritative. When interception for a method is disabled, pass
   the request to System unchanged even for a caller allowed by `scoop`

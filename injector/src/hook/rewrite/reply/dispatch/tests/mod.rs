@@ -13,6 +13,34 @@ mod one_way;
 mod operation_dispatch;
 
 #[test]
+fn synthetic_security_level_dispatch_preserves_system_namespace_routing() {
+    let _guard = route_state_test_guard();
+    let target = LocalBinderTarget { ptr: 0x2239, cookie: 0x6683 };
+    let level = crate::android::hardware::security::keymint::SecurityLevel::SecurityLevel::TRUSTED_ENVIRONMENT;
+    tracker::remember_security_level_target(
+        target,
+        SecurityLevelTargetInfo { security_level: level },
+    );
+    for (domain, code) in [
+        (Domain::BLOB, crate::android::system::keystore2::IKeystoreSecurityLevel::transactions::r#convertStorageKeyToEphemeral),
+        (Domain::SELINUX, crate::android::system::keystore2::IKeystoreSecurityLevel::transactions::r#deleteKey),
+    ] {
+        let mut parcel = request_parcel(identify::KEYSTORE_SECURITY_LEVEL_INTERFACE);
+        parcel.write(&KeyDescriptor { domain, ..sample_key_descriptor() }).unwrap();
+        let (mut tr, _data) = transaction_for_parcel(target, code, parcel);
+        tr.sender_euid = 1000;
+        let info = SyntheticTargetInfo { kind: SyntheticTargetKind::SecurityLevel, caller: None, native_generation: None, operation: None };
+        let reply = unsafe { build_synthetic_br_transaction_reply(&tr, target, info.clone(), Some("u:r:system_server:s0".into()), "test") }.unwrap();
+        assert!(matches!(reply, SyntheticReply::SystemSecurityLevel(value) if value == level));
+        if domain == Domain::SELINUX {
+            tr.flags = super::super::super::super::binder::TF_ONE_WAY;
+            let reply = unsafe { build_synthetic_br_transaction_reply(&tr, target, info, None, "test") }.unwrap();
+            assert!(matches!(reply, SyntheticReply::SystemSecurityLevel(value) if value == level));
+        }
+    }
+}
+
+#[test]
 fn untracked_native_target_is_not_intercepted() {
     let _guard = route_state_test_guard();
     let target = LocalBinderTarget { ptr: 0x1234, cookie: 0x5678 };

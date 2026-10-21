@@ -16,7 +16,10 @@ fn route_for_service_request(
     allowed: bool,
     intercept: &config::InterceptConfig,
 ) -> RouteTarget {
-    if allowed && identify::is_omk_service_route_enabled(request.method(), intercept) {
+    if allowed
+        && !service_request_uses_system_namespace(request)
+        && identify::is_omk_service_route_enabled(request.method(), intercept)
+    {
         RouteTarget::Omk
     } else {
         RouteTarget::System
@@ -166,10 +169,17 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
 
         let method = request.method();
         let (route, packages, reason) = match &request {
-            ParsedMaintenanceRequest::MigrateKeyNamespace { .. } => {
+            ParsedMaintenanceRequest::MigrateKeyNamespace { source, destination } => {
                 let decision = evaluate_caller(&caller, &cfg);
                 (
-                    if decision.allowed { RouteTarget::Omk } else { RouteTarget::System },
+                    if decision.allowed
+                        && !is_system_namespace(source.domain)
+                        && !is_system_namespace(destination.domain)
+                    {
+                        RouteTarget::Omk
+                    } else {
+                        RouteTarget::System
+                    },
                     decision.packages,
                     Some(decision.reason),
                 )
@@ -362,7 +372,9 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
         // Keystore2 shares each security-level Binder between getSecurityLevel and getKeyEntry.
         let scoop_enabled = security_level_scoop_enabled(&cfg.intercept);
         let decision = scoop_enabled.then(|| evaluate_caller(&caller, &cfg));
-        let route = if decision.as_ref().is_some_and(|decision| decision.allowed) {
+        let route = if !security_level_request_uses_system_namespace(&request)
+            && decision.as_ref().is_some_and(|decision| decision.allowed)
+        {
             RouteTarget::Omk
         } else {
             RouteTarget::System

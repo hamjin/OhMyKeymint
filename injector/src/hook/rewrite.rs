@@ -4,6 +4,7 @@ use super::binder::{
     LocalBinderTarget, NativeBinder, NativeBinderRetirement,
 };
 use super::{BinderFdToken, BinderStateKey};
+use crate::android::system::keystore2::Domain::Domain;
 use crate::android::system::keystore2::IKeystoreOperation::IKeystoreOperation as AospKeystoreOperation;
 use crate::android::system::keystore2::KeyDescriptor::KeyDescriptor;
 use crate::android::system::keystore2::KeyEntryResponse::KeyEntryResponse;
@@ -91,6 +92,45 @@ fn evaluate_caller(
         ipc::resolve_packages_for_uid(uid)
     };
     filter::evaluate(&cfg.scoop, &cfg.filter, uid, package_resolution)
+}
+
+fn service_request_key(request: &ParsedServiceRequest) -> Option<&KeyDescriptor> {
+    match request {
+        ParsedServiceRequest::GetKeyEntry { key }
+        | ParsedServiceRequest::UpdateSubcomponent { key, .. }
+        | ParsedServiceRequest::DeleteKey { key }
+        | ParsedServiceRequest::Grant { key, .. }
+        | ParsedServiceRequest::Ungrant { key, .. } => Some(key),
+        _ => None,
+    }
+}
+
+fn is_system_namespace(domain: Domain) -> bool {
+    matches!(domain, Domain::SELINUX | Domain::BLOB)
+}
+
+fn service_request_uses_system_namespace(request: &ParsedServiceRequest) -> bool {
+    match request {
+        ParsedServiceRequest::ListEntries { domain, .. }
+        | ParsedServiceRequest::GetNumberOfEntries { domain, .. }
+        | ParsedServiceRequest::ListEntriesBatched { domain, .. } => is_system_namespace(*domain),
+        _ => service_request_key(request).is_some_and(|key| is_system_namespace(key.domain)),
+    }
+}
+
+fn security_level_request_uses_system_namespace(request: &ParsedSecurityLevelRequest) -> bool {
+    // Only the request's destination/primary namespace determines scope. An APP
+    // request with an external attestation or wrapping key remains authoritative
+    // on OMK; those secondary descriptors are passed to it unchanged.
+    let key = match request {
+        ParsedSecurityLevelRequest::CreateOperation { key, .. }
+        | ParsedSecurityLevelRequest::GenerateKey { key, .. }
+        | ParsedSecurityLevelRequest::ImportKey { key, .. }
+        | ParsedSecurityLevelRequest::ImportWrappedKey { key, .. }
+        | ParsedSecurityLevelRequest::DeleteKey { key }
+        | ParsedSecurityLevelRequest::ConvertStorageKeyToEphemeral { storage_key: key } => key,
+    };
+    is_system_namespace(key.domain)
 }
 
 fn precompute_omk_service_mutator_reply(
