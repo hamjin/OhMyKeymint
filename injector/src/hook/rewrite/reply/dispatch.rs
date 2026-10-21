@@ -14,7 +14,9 @@ struct Keystore2AidlMetadata {
 
 fn synthetic_target_interface(kind: SyntheticTargetKind) -> &'static str {
     match kind {
-        SyntheticTargetKind::SecurityLevel => identify::KEYSTORE_SECURITY_LEVEL_INTERFACE,
+        SyntheticTargetKind::SecurityLevel | SyntheticTargetKind::SystemNamespaceSecurityLevel => {
+            identify::KEYSTORE_SECURITY_LEVEL_INTERFACE
+        }
         SyntheticTargetKind::Operation => identify::KEYSTORE_OPERATION_INTERFACE,
     }
 }
@@ -32,7 +34,7 @@ fn synthetic_parse_error_status_code(error: &anyhow::Error) -> StatusCode {
 fn synthetic_parse_error_reply(status: StatusCode) -> anyhow::Result<SyntheticReply> {
     if status == StatusCode::UnexpectedNull {
         return Ok(synthetic_parcel_reply(parcel::build_status_reply(
-            &Status::from(status),
+            &Status::from(ExceptionCode::NullPointer),
         )?));
     }
     Ok(SyntheticReply::Status(status.into()))
@@ -55,7 +57,7 @@ fn synthetic_unknown_transaction_reply_for(
     code: u32,
 ) -> Option<SyntheticReply> {
     let known = match kind {
-        SyntheticTargetKind::SecurityLevel => {
+        SyntheticTargetKind::SecurityLevel | SyntheticTargetKind::SystemNamespaceSecurityLevel => {
             identify::security_level_method_from_code(code).is_some()
         }
         SyntheticTargetKind::Operation => identify::operation_method_from_code(code).is_some(),
@@ -226,16 +228,18 @@ fn synthetic_transaction_caller(
 
 pub(in crate::hook::rewrite) fn can_execute_one_way(kind: SyntheticTargetKind, code: u32) -> bool {
     match kind {
-        SyntheticTargetKind::SecurityLevel => matches!(
-            identify::security_level_method_from_code(code),
-            Some(
-                SecurityLevelMethod::GenerateKey
-                    | SecurityLevelMethod::CreateOperation
-                    | SecurityLevelMethod::ImportKey
-                    | SecurityLevelMethod::ImportWrappedKey
-                    | SecurityLevelMethod::DeleteKey
+        SyntheticTargetKind::SecurityLevel | SyntheticTargetKind::SystemNamespaceSecurityLevel => {
+            matches!(
+                identify::security_level_method_from_code(code),
+                Some(
+                    SecurityLevelMethod::GenerateKey
+                        | SecurityLevelMethod::CreateOperation
+                        | SecurityLevelMethod::ImportKey
+                        | SecurityLevelMethod::ImportWrappedKey
+                        | SecurityLevelMethod::DeleteKey
+                )
             )
-        ),
+        }
         SyntheticTargetKind::Operation => matches!(
             identify::operation_method_from_code(code),
             Some(
@@ -372,7 +376,7 @@ unsafe fn build_synthetic_br_transaction_reply_inner(
     }
 
     let cfg = config::get();
-    if !cfg.main.enabled && kind != SyntheticTargetKind::SecurityLevel {
+    if !cfg.main.enabled && kind == SyntheticTargetKind::Operation {
         warn!(
             "event=synthetic injector disabled while synthetic target ptr=0x{:x} cookie=0x{:x} is still live; returning SYSTEM_ERROR",
             target.ptr, target.cookie
@@ -383,7 +387,9 @@ unsafe fn build_synthetic_br_transaction_reply_inner(
     }
 
     let fallback = match kind {
-        SyntheticTargetKind::SecurityLevel => None,
+        SyntheticTargetKind::SecurityLevel | SyntheticTargetKind::SystemNamespaceSecurityLevel => {
+            None
+        }
         SyntheticTargetKind::Operation => Some(
             info.caller
                 .as_ref()
@@ -391,7 +397,7 @@ unsafe fn build_synthetic_br_transaction_reply_inner(
         ),
     };
     let caller = synthetic_transaction_caller(fallback, tr, caller_sid);
-    if kind == SyntheticTargetKind::SecurityLevel {
+    if kind != SyntheticTargetKind::Operation {
         let request = match parcel::parse_security_level_request(
             data,
             data_size,
@@ -410,7 +416,10 @@ unsafe fn build_synthetic_br_transaction_reply_inner(
             }
         };
         let method = request.method();
-        if security_level_request_uses_system_namespace(&request) {
+        if security_level_request_uses_system_namespace(
+            &request,
+            kind == SyntheticTargetKind::SystemNamespaceSecurityLevel,
+        ) {
             let target_info = tracker::lookup_security_level_target(target)
                 .ok_or_else(|| anyhow::anyhow!("missing synthetic security-level mapping"))?;
             info!(

@@ -12,6 +12,18 @@ fn write_parser_tracks_transaction_and_reply_completions() {
     reset_pending_reply_frames_for_test(0, 0);
     let tr: binder_transaction_data = unsafe { std::mem::zeroed() };
     let mut write = Vec::new();
+    // Ordinary System nodes and synthetic security-level nodes have no
+    // operation-publication reservation. Neither acknowledgement is a transaction.
+    for ptr in [0x1000, 0x2000] {
+        push_unaligned(&mut write, &BC_ACQUIRE_DONE_CMD);
+        push_unaligned(
+            &mut write,
+            &binder_ptr_cookie {
+                ptr,
+                cookie: ptr + 1,
+            },
+        );
+    }
     let bc_transaction_cmd = BC_REPLY_CMD - BC_REPLY_NR + BC_TRANSACTION_NR;
     push_unaligned(&mut write, &bc_transaction_cmd);
     push_unaligned(&mut write, &tr);

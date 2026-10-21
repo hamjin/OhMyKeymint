@@ -49,19 +49,25 @@ State in the pull request what behavior remains unchanged.
   synthetic security-level handles. Secondary attestation and wrapping descriptors
   do not change an APP request's backend. Migration involving either System
   namespace stays on System, and these namespaces are not mirrored into OMK.
+- Successful SELINUX/BLOB `getKeyEntry` replies use dedicated security-level
+  handles that retain the System namespace context for subsequent KEY_ID calls.
+  Preserve the returned descriptor and metadata. Ordinary handles keep the usual
+  KEY_ID routing; do not track key origins or retry another backend on errors.
 - For every in-scope request routed by `scoop` with
   `FilterDecision::allowed == true`, OMK is the only backend during normal
   reachable operation. Per-method intercept settings still determine whether a
   request is routed by `scoop`.
-- Apart from the fixed primary-namespace boundary, choose the backend only from
-  the current caller, filter decision, method, and configuration. Do not inspect
+- Apart from the fixed primary-namespace boundary and its dedicated handle
+  context, choose the backend only from the current caller, filter decision,
+  method, and configuration. Do not inspect
   or infer which backend created a key, `KeyDescriptor`, `KEY_ID`, `GRANT`, alias,
   wrapping key, or attestation key.
 - Per-method intercept settings are authoritative. When interception for a
   method is disabled, pass the request to System unchanged even when `scoop`
   allows the caller.
-- Do not provide key or descriptor continuity between System and OMK. Pass old,
-  externally supplied, and System-created descriptors to the selected backend
+- Except for the System namespace handle context above, do not provide key or
+  descriptor continuity between System and OMK. Pass old, externally supplied,
+  and System-created descriptors to the selected backend
   unchanged. An OMK business error for such a descriptor is authoritative.
 - Return OMK business errors unchanged. Reachable transport, boundary, or
   injector failures that are not OMK-unavailable must not fall back to a

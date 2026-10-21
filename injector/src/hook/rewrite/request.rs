@@ -51,6 +51,13 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
         return false;
     }
 
+    // Binder base transactions (for example INTERFACE_TRANSACTION) do not carry
+    // an AIDL request header. Keep their reply frame, but let libbinder handle
+    // the payload without attempting to decode a business request.
+    if !(rsbinder::FIRST_CALL_TRANSACTION..=rsbinder::LAST_CALL_TRANSACTION).contains(&tr.code) {
+        return false;
+    }
+
     let cfg = config::get();
     if !cfg.main.enabled {
         debug!("event=decision injector disabled by config");
@@ -533,7 +540,7 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
         };
         // Keystore2 shares each security-level Binder between getSecurityLevel and getKeyEntry.
         let scoop_enabled = security_level_scoop_enabled(&cfg.intercept);
-        let route = if !security_level_request_uses_system_namespace(&request)
+        let route = if !security_level_request_uses_system_namespace(&request, false)
             && (allow_unknown_omk_route || decision.allowed && scoop_enabled)
         {
             RouteTarget::Omk

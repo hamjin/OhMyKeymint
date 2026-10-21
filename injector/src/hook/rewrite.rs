@@ -79,7 +79,7 @@ pub(super) use request::handle_br_transaction;
 
 type OutboundReply = parcel::OwnedReply;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RouteTarget {
     System,
     Omk,
@@ -134,7 +134,10 @@ fn service_request_uses_system_namespace(request: &ParsedServiceRequest) -> bool
     }
 }
 
-fn security_level_request_uses_system_namespace(request: &ParsedSecurityLevelRequest) -> bool {
+fn security_level_request_uses_system_namespace(
+    request: &ParsedSecurityLevelRequest,
+    system_namespace_context: bool,
+) -> bool {
     // Only the request's destination/primary namespace determines scope. An APP
     // request with an external attestation or wrapping key remains authoritative
     // on OMK; those secondary descriptors are passed to it unchanged.
@@ -146,7 +149,7 @@ fn security_level_request_uses_system_namespace(request: &ParsedSecurityLevelReq
         | ParsedSecurityLevelRequest::DeleteKey { key }
         | ParsedSecurityLevelRequest::ConvertStorageKeyToEphemeral { storage_key: key } => key,
     };
-    is_system_namespace(key.domain)
+    is_system_namespace(key.domain) || system_namespace_context && key.domain == Domain::KEY_ID
 }
 
 fn security_level_request_key(request: &ParsedSecurityLevelRequest) -> Option<&KeyDescriptor> {
@@ -223,7 +226,7 @@ fn should_allow_omk_grant_security_level_request_with_probe(
     caller: &CallerInfo,
     mut probe: impl FnMut(&CallerInfo, &KeyDescriptor) -> anyhow::Result<bool>,
 ) -> anyhow::Result<bool> {
-    if security_level_request_uses_system_namespace(request) {
+    if security_level_request_uses_system_namespace(request, false) {
         return Ok(false);
     }
     let Some(grant) = security_level_request_key(request) else {

@@ -1,5 +1,131 @@
 use super::*;
 
+#[test]
+fn system_namespace_lookup_retains_key_id_context_without_changing_metadata_or_app_routes() {
+    let _guard = route_state_test_guard();
+    let level = SecurityLevel::TRUSTED_ENVIRONMENT;
+    let caller = CallerInfo {
+        uid: 1000,
+        pid: 2913,
+        sid: "u:r:system_server:s0".into(),
+    };
+    let original = create_native_security_level_binder().unwrap();
+    let metadata = || KeyMetadata {
+        key: KeyDescriptor {
+            domain: Domain::KEY_ID,
+            nspace: 0x1234,
+            alias: None,
+            blob: None,
+        },
+        keySecurityLevel: level,
+        authorizations: vec![],
+        certificate: Some(vec![1, 2, 3]),
+        certificateChain: None,
+        modificationTimeMs: 123,
+    };
+    let omk = register_synthetic_security_level_carrier(
+        level,
+        ServiceMethod::GetSecurityLevel,
+        &caller,
+        RouteTarget::Omk,
+    )
+    .unwrap();
+    let omk_target = carrier_target(&omk);
+    // A pending authorization mirror must not block a System namespace operation.
+    let _pending_mirror = reserve_mirror_update(
+        MirrorStateKind::Authorization,
+        MirrorFailurePolicy::BestEffort,
+    )
+    .unwrap();
+    assert!(ensure_mirror_state_recovered().is_err());
+    let mut system_target = None;
+    for domain in [Domain::SELINUX, Domain::BLOB, Domain::APP, Domain::KEY_ID] {
+        let mut system_reply =
+            parcel::build_key_entry_reply_with_carrier_bytes(metadata(), original.carrier(), true)
+                .unwrap();
+        let (data, data_size, offsets, offsets_size) = raw_parts(&mut system_reply);
+        let mut tr: binder_transaction_data = unsafe { std::mem::zeroed() };
+        tr.data.ptr.buffer = data as libc::c_ulong;
+        tr.data.ptr.offsets = offsets as libc::c_ulong;
+        tr.data_size = data_size;
+        tr.offsets_size = offsets_size;
+        let pending = PendingServiceCall {
+            request: ParsedServiceRequest::GetKeyEntry {
+                key: KeyDescriptor {
+                    domain,
+                    ..sample_key_descriptor()
+                },
+            },
+            caller: caller.clone(),
+            packages: vec!["android".into()],
+            route: RouteTarget::System,
+        };
+        let rewrite = unsafe { observe_system_service_reply(&tr, &pending) }.unwrap();
+        if !matches!(domain, Domain::SELINUX | Domain::BLOB) {
+            assert!(
+                rewrite.is_none(),
+                "ordinary System key replies must keep their original handle"
+            );
+            continue;
+        }
+        let mut reply = rewrite.expect("System namespace reply needs its own handle");
+        let (data, size, offsets, offsets_size) = raw_parts(&mut reply);
+        let (carrier, parsed) =
+            unsafe { parcel::parse_key_entry_reply(data, size, offsets, offsets_size) }.unwrap();
+        let expected_metadata = parcel::build_plain_reply(&metadata()).unwrap();
+        let actual_metadata = parcel::build_plain_reply(&parsed).unwrap();
+        assert_eq!(
+            unsafe {
+                std::slice::from_raw_parts(actual_metadata.data_ptr(), actual_metadata.data_size())
+            },
+            unsafe {
+                std::slice::from_raw_parts(
+                    expected_metadata.data_ptr(),
+                    expected_metadata.data_size(),
+                )
+            },
+        );
+        let target = carrier_target(&carrier);
+        assert_ne!(target, omk_target);
+        assert_eq!(
+            lookup_synthetic_target(target),
+            Some(SyntheticTargetKind::SystemNamespaceSecurityLevel)
+        );
+        if let Some(previous) = system_target {
+            assert_eq!(target, previous);
+        }
+        system_target = Some(target);
+        let mut request = request_parcel(identify::KEYSTORE_SECURITY_LEVEL_INTERFACE);
+        request.write(&parsed.key).unwrap();
+        request
+            .write(&Vec::<
+                crate::android::hardware::security::keymint::KeyParameter::KeyParameter,
+            >::new())
+            .unwrap();
+        request.write(&false).unwrap();
+        let (mut operation, _data) = transaction_for_parcel(target,
+            crate::android::system::keystore2::IKeystoreSecurityLevel::transactions::r#createOperation, request);
+        operation.sender_euid = 1000;
+        let reply = unsafe {
+            handle_synthetic_br_transaction(&operation, Some(caller.sid.clone()), "test")
+        }
+        .unwrap();
+        assert!(matches!(reply, SyntheticReply::SystemSecurityLevel(value) if value == level));
+    }
+    let reused = register_synthetic_security_level_carrier(
+        level,
+        ServiceMethod::GetKeyEntry,
+        &caller,
+        RouteTarget::Omk,
+    )
+    .unwrap();
+    assert_eq!(carrier_target(&reused), omk_target);
+    assert_eq!(
+        lookup_synthetic_target(omk_target),
+        Some(SyntheticTargetKind::SecurityLevel)
+    );
+}
+
 fn no_carrier_operation_target() -> (
     LocalBinderTarget,
     parcel::OwnedReply,

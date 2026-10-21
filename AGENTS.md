@@ -41,18 +41,22 @@
   unchanged, including through synthetic security-level handles. A secondary attestation or
   wrapping key does not change an APP request's backend. Namespace migration involving SELINUX
   or BLOB stays on System; these namespaces are not mirrored into OMK.
+- Successful SELINUX/BLOB `getKeyEntry` replies retain their namespace context in a dedicated
+  security-level handle. KEY_ID requests through that handle stay on System, with the returned
+  descriptor and metadata unchanged. Ordinary handles retain the usual KEY_ID routing. Do not
+  infer a key's backend, keep a key-origin registry, or retry another backend after a lookup error.
 - For every in-scope request routed by `scoop` with `FilterDecision::allowed == true`, OMK is the only
   backend during normal reachable operation. Per-method intercept settings still determine whether
   a request is routed by `scoop`.
-- Apart from the fixed primary-namespace boundary, choose the backend only from the current
-  caller, filter decision, method, and configuration. Do not read or infer which backend created
-  a key, `KeyDescriptor`, `KEY_ID`, `GRANT`, alias,
-  wrapping key, or attestation key.
+- Apart from the fixed primary-namespace boundary and its dedicated handle context, choose the
+  backend only from the current caller, filter decision, method, and configuration. Do not read
+  or infer which backend created a key, `KeyDescriptor`, `KEY_ID`, `GRANT`, alias, wrapping key,
+  or attestation key.
 - Per-method intercept settings are authoritative. When interception for a method is disabled, pass
   the request to System unchanged even for a caller allowed by `scoop`
-- Do not support key or descriptor continuity between System and OMK. Pass old, externally
-  supplied, and System-created descriptors to the selected backend unchanged; an OMK business
-  error for such a descriptor is authoritative.
+- Except for the System namespace handle context above, do not support key or descriptor continuity
+  between System and OMK. Pass old, externally supplied, and System-created descriptors to the
+  selected backend unchanged; an OMK business error for such a descriptor is authoritative.
 - Return OMK business errors as-is. Reachable transport, boundary, or injector failures that are
   not OMK-unavailable must not fall back to a successful system reply; normalize them to the
   existing AOSP-compatible error path, such as `SYSTEM_ERROR` where applicable.

@@ -533,6 +533,13 @@ inside keystore2, retaining the caller's identity and the System reply.
 An APP request's secondary attestation or wrapping key does not change its
 backend; OMK receives that descriptor unchanged.
 
+System `getKeyEntry` replies for SELINUX/BLOB namespaces use a dedicated
+security-level handle while preserving the descriptor and metadata. KEY_ID
+requests through that handle continue on System, including when OMK has pending
+authorization updates. Ordinary security-level handles keep the configured
+KEY_ID routing. This does not create a key-origin registry or enable fallback
+after an OMK lookup error.
+
 All callers, including `vold` and `system_server`, follow the same namespace
 boundary and configured package rules for APP, KEY_ID, and GRANT requests.
 There are no process-specific routing exclusions. Routing does not probe which

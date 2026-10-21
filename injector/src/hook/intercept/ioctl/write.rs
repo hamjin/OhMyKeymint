@@ -317,12 +317,14 @@ pub(super) unsafe fn parse_write_buffer(
                     ptr: ptr_cookie.ptr,
                     cookie: ptr_cookie.cookie,
                 };
-                completion_commands.push((
-                    offset + cmd_size,
-                    None,
-                    false,
-                    operation_publication_pending_acquire(target, binder_state_key(fd)),
-                ));
+                // BC_ACQUIRE_DONE acknowledges a reference; the driver does not
+                // emit BR_TRANSACTION_COMPLETE for it. Only track publication
+                // ownership when this is one of our synthetic operation nodes.
+                if let Some(retirement) =
+                    operation_publication_pending_acquire(target, binder_state_key(fd))
+                {
+                    completion_commands.push((offset + cmd_size, None, false, Some(retirement)));
+                }
             }
         }
 
