@@ -66,6 +66,7 @@ pub(in crate::hook) struct OperationPublicationProbe {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::hook) enum SyntheticTargetKind {
     SecurityLevel,
+    SystemNamespaceSecurityLevel,
     Operation,
 }
 
@@ -90,7 +91,10 @@ static OPERATION_TARGETS: LazyLock<Mutex<HashMap<LocalBinderTarget, OperationTar
 static SYNTHETIC_SECURITY_LEVEL_TARGETS: LazyLock<
     Mutex<
         HashMap<
-            crate::android::hardware::security::keymint::SecurityLevel::SecurityLevel,
+            (
+                crate::android::hardware::security::keymint::SecurityLevel::SecurityLevel,
+                RouteTarget,
+            ),
             LocalBinderTarget,
         >,
     >,
@@ -426,12 +430,14 @@ pub(in crate::hook::rewrite) fn register_synthetic_security_level_carrier(
     security_level: crate::android::hardware::security::keymint::SecurityLevel::SecurityLevel,
     source_method: ServiceMethod,
     caller: &CallerInfo,
+    route: RouteTarget,
 ) -> anyhow::Result<parcel::ReplyBinderCarrier> {
+    let cache_key = (security_level, route);
     let (target, carrier) = {
         let mut targets = SYNTHETIC_SECURITY_LEVEL_TARGETS
             .lock()
             .expect("synthetic security-level target map poisoned");
-        if let Some(target) = targets.get(&security_level) {
+        if let Some(target) = targets.get(&cache_key) {
             let native =
                 NATIVE_BINDERS.lock().expect("native binder map poisoned").get(target).cloned();
             let carrier = if let Some(native) = native {
@@ -445,7 +451,8 @@ pub(in crate::hook::rewrite) fn register_synthetic_security_level_carrier(
             };
             (*target, carrier)
         } else {
-            let native = Arc::new(create_native_security_level_binder()?);
+            let native =
+                Arc::new(create_native_security_level_binder(route == RouteTarget::System)?);
             let target = native.target();
             let carrier = native_binder_carrier(&native);
             let mut binders = NATIVE_BINDERS.lock().expect("native binder map poisoned");
@@ -461,21 +468,24 @@ pub(in crate::hook::rewrite) fn register_synthetic_security_level_carrier(
             synthetic.insert(
                 target,
                 SyntheticTargetInfo {
-                    kind: SyntheticTargetKind::SecurityLevel,
+                    kind: match route {
+                        RouteTarget::Omk => SyntheticTargetKind::SecurityLevel,
+                        RouteTarget::System => SyntheticTargetKind::SystemNamespaceSecurityLevel,
+                    },
                     #[cfg(test)]
                     caller: None,
                     native_generation: None,
                     operation: None,
                 },
             );
-            targets.insert(security_level, target);
+            targets.insert(cache_key, target);
             (target, carrier)
         }
     };
     tracker::remember_security_level_target(target, SecurityLevelTargetInfo { security_level });
     info!(
-        "event=synthetic registered/reused security-level target ptr=0x{:x} cookie=0x{:x} security_level={:?} source_method={:?} uid={} pid={} sid='{}'",
-        target.ptr, target.cookie, security_level, source_method, caller.uid, caller.pid, caller.sid
+        "event=synthetic registered/reused security-level target ptr=0x{:x} cookie=0x{:x} security_level={:?} source_method={:?} namespace_route={:?} uid={} pid={} sid='{}'",
+        target.ptr, target.cookie, security_level, source_method, route, caller.uid, caller.pid, caller.sid
     );
     Ok(carrier)
 }

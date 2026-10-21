@@ -18,6 +18,7 @@ log_level = "debug"
 
 [filter]
 # SELINUX/BLOB primary namespaces always stay on System.
+# Their getKeyEntry handles also keep subsequent KEY_ID requests on System.
 enabled = true
 deny_packages = []
 block_android_package = true

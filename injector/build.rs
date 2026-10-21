@@ -18,6 +18,23 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TARGET");
     println!("cargo:rustc-link-arg-bin=inject=-Wl,--export-dynamic-symbol=entry");
 
+    // Git metadata is outside the crate. Watch both loose and packed refs so a
+    // cached build script cannot report an older commit after checkout/commit.
+    // --git-path also resolves the shared refs directory for linked worktrees.
+    for name in ["HEAD", "refs", "packed-refs"] {
+        if let Some(path) = Command::new("git")
+            .args(["rev-parse", "--git-path", name])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|path| PathBuf::from(path.trim()))
+            .filter(|path| path.exists())
+        {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+
     let build_target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
     let package_version =
         std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown-version".to_string());

@@ -9,6 +9,26 @@ use rsbinder::{Status, StatusCode};
 use std::mem::size_of;
 
 #[test]
+fn binder_base_requests_keep_their_reply_frame_without_decoding_an_aidl_header() {
+    let _guard = route_state_test_guard();
+    let connection = 45;
+    for code in
+        [rsbinder::INTERFACE_TRANSACTION, rsbinder::PING_TRANSACTION, rsbinder::DUMP_TRANSACTION]
+    {
+        let mut tr: binder_transaction_data = unsafe { std::mem::zeroed() };
+        tr.code = code;
+        // An empty parcel is valid for INTERFACE_TRANSACTION and PING. DUMP
+        // arguments must be interpreted by libbinder, not the AIDL parser.
+        assert!(!unsafe { handle_br_transaction(connection, &mut tr, None, "test") });
+        assert_eq!(tr.code, code);
+        assert_eq!(pending_reply_frame_count_for_test(connection), 1);
+        let frame = unsafe { handle_bc_reply(connection, &mut tr, false) };
+        commit_bc_reply(connection, frame, unsafe { tr.data.ptr.buffer } as usize);
+        assert_eq!(pending_reply_frame_count_for_test(connection), 0);
+    }
+}
+
+#[test]
 fn native_system_callers_use_the_configured_android_package_block() {
     let cfg = config::InjectorConfig::default();
     for (uid, sid) in [(0, "u:r:vold:s0"), (1000, "u:r:system_server:s0")] {
@@ -118,9 +138,15 @@ fn security_level_scope_uses_primary_namespace_and_keeps_secondary_descriptors_u
         ];
         for request in requests {
             assert_eq!(
-                security_level_request_uses_system_namespace(&request),
+                security_level_request_uses_system_namespace(&request, false),
                 matches!(domain, Domain::SELINUX | Domain::BLOB),
                 "{:?}",
+                request.method()
+            );
+            assert_eq!(
+                security_level_request_uses_system_namespace(&request, true),
+                matches!(domain, Domain::SELINUX | Domain::BLOB | Domain::KEY_ID),
+                "System namespace handle: {:?}",
                 request.method()
             );
         }
@@ -136,7 +162,7 @@ fn system_namespace_cannot_enter_omk_via_a_wrapping_key_grant() {
         params: vec![],
         authenticators: vec![],
     };
-    assert!(security_level_request_uses_system_namespace(&request));
+    assert!(security_level_request_uses_system_namespace(&request, false));
     assert!(!maintenance_requires_mirror(&ParsedMaintenanceRequest::ClearNamespace {
         domain: Domain::SELINUX,
         nspace: 100

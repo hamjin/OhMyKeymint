@@ -53,6 +53,13 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
         return false;
     }
 
+    // Binder base transactions (for example INTERFACE_TRANSACTION) do not carry
+    // an AIDL request header. Keep their reply frame, but let libbinder handle
+    // the payload without attempting to decode a business request.
+    if !(rsbinder::FIRST_CALL_TRANSACTION..=rsbinder::LAST_CALL_TRANSACTION).contains(&tr.code) {
+        return false;
+    }
+
     let Some(parcel_bytes) = super::super::binder::transaction_data_bytes(tr) else {
         warn!(
             "event=decision null parcel buffer for {} code=0x{:x} uid={} pid={}",
@@ -372,7 +379,7 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
         // Keystore2 shares each security-level Binder between getSecurityLevel and getKeyEntry.
         let scoop_enabled = security_level_scoop_enabled(&cfg.intercept);
         let decision = scoop_enabled.then(|| evaluate_caller(&caller, &cfg));
-        let route = if !security_level_request_uses_system_namespace(&request)
+        let route = if !security_level_request_uses_system_namespace(&request, false)
             && decision.as_ref().is_some_and(|decision| decision.allowed)
         {
             RouteTarget::Omk

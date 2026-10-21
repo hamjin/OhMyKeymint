@@ -348,12 +348,14 @@ pub(super) unsafe fn parse_prepared_write_buffer(
             if cmd == BC_ACQUIRE_DONE_CMD && cmd_size == size_of::<binder_ptr_cookie>() {
                 let ptr_cookie = std::ptr::read_unaligned(payload as *const binder_ptr_cookie);
                 let target = LocalBinderTarget { ptr: ptr_cookie.ptr, cookie: ptr_cookie.cookie };
-                completion_commands.push((
-                    offset + cmd_size,
-                    None,
-                    false,
-                    operation_publication_pending_acquire(target, binder_state_key(fd)),
-                ));
+                // BC_ACQUIRE_DONE acknowledges a reference; the driver does not
+                // emit BR_TRANSACTION_COMPLETE for it. Only track publication
+                // ownership when this is one of our synthetic operation nodes.
+                if let Some(retirement) =
+                    operation_publication_pending_acquire(target, binder_state_key(fd))
+                {
+                    completion_commands.push((offset + cmd_size, None, false, Some(retirement)));
+                }
             }
         }
 

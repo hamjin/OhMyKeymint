@@ -187,6 +187,7 @@ pub(super) fn build_no_carrier_omk_key_entry_reply(
         entry.r#metadata.keySecurityLevel,
         ServiceMethod::GetKeyEntry,
         caller,
+        RouteTarget::Omk,
     )?;
     parcel::build_key_entry_reply_with_carrier_bytes(
         entry.r#metadata,
@@ -205,6 +206,7 @@ fn build_direct_omk_security_level_reply(
                 security_level,
                 ServiceMethod::GetSecurityLevel,
                 caller,
+                RouteTarget::Omk,
             )?;
             Ok(Some(parcel::build_get_security_level_reply_with_carrier_bytes(
                 &carrier.bytes,
@@ -249,7 +251,7 @@ pub(super) unsafe fn observe_system_service_reply(
                 "getSecurityLevel security-level carrier"
             );
         }
-        ParsedServiceRequest::GetKeyEntry { .. } => {
+        ParsedServiceRequest::GetKeyEntry { key } => {
             let (carrier, metadata) =
                 match parcel::parse_key_entry_reply(data, data_size, offsets, offsets_size) {
                     Ok(response) => response,
@@ -272,6 +274,25 @@ pub(super) unsafe fn observe_system_service_reply(
                 ),
                 "getKeyEntry security-level carrier"
             );
+            if is_system_namespace(key.domain) && carrier.is_object {
+                // System resolves a SELINUX alias to a KEY_ID in metadata. Give
+                // this lookup its own namespace-context handle so the follow-up
+                // operation does not lose its System namespace at that boundary.
+                let carrier = finalize_system_success!(
+                    register_synthetic_security_level_carrier(
+                        metadata.r#keySecurityLevel,
+                        ServiceMethod::GetKeyEntry,
+                        &pending.caller,
+                        RouteTarget::System,
+                    ),
+                    "System namespace security-level carrier"
+                );
+                return Ok(Some(parcel::build_key_entry_reply_with_carrier_bytes(
+                    metadata,
+                    &carrier.bytes,
+                    carrier.is_object,
+                )?));
+            }
         }
         _ => {}
     }

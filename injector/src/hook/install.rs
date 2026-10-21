@@ -7,8 +7,7 @@ use log::{debug, info};
 
 use super::{
     intercept, new_close, new_dup, new_dup2, new_dup3, new_fcntl, new_fdsan_close, new_ioctl,
-    rewrite, HOOK_INIT, OLD_CLOSE, OLD_DUP, OLD_DUP2, OLD_DUP3, OLD_FCNTL, OLD_FDSAN_CLOSE,
-    OLD_IOCTL,
+    HOOK_INIT, OLD_CLOSE, OLD_DUP, OLD_DUP2, OLD_DUP3, OLD_FCNTL, OLD_FDSAN_CLOSE, OLD_IOCTL,
 };
 use crate::{config, ipc};
 

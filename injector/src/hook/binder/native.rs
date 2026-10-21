@@ -41,13 +41,14 @@ impl NativeBinderUserData {
 #[derive(Clone, Copy)]
 enum NativeBinderKind {
     SecurityLevel,
+    SystemNamespaceSecurityLevel,
     Operation,
 }
 
 impl NativeBinderKind {
     fn label(self) -> &'static str {
         match self {
-            Self::SecurityLevel => "security-level",
+            Self::SecurityLevel | Self::SystemNamespaceSecurityLevel => "security-level",
             Self::Operation => "operation",
         }
     }
@@ -413,6 +414,9 @@ unsafe fn native_binder_on_transact_inner(
         &tr,
         match user_data.kind {
             NativeBinderKind::SecurityLevel => SyntheticTargetKind::SecurityLevel,
+            NativeBinderKind::SystemNamespaceSecurityLevel => {
+                SyntheticTargetKind::SystemNamespaceSecurityLevel
+            }
             NativeBinderKind::Operation => SyntheticTargetKind::Operation,
         },
         user_data.operation.get().map(Arc::as_ref),
@@ -896,7 +900,9 @@ fn create_native_binder_with_api(
 ) -> Result<NativeBinder> {
     let user_data = Box::into_raw(Box::new(NativeBinderUserData::new(kind)));
     let class = match kind {
-        NativeBinderKind::SecurityLevel => api.security_level_class,
+        NativeBinderKind::SecurityLevel | NativeBinderKind::SystemNamespaceSecurityLevel => {
+            api.security_level_class
+        }
         NativeBinderKind::Operation => api.operation_class,
     };
     let binder = unsafe { (api.binder_new)(class as *const c_void, user_data as *mut c_void) };
@@ -985,8 +991,15 @@ fn create_native_binder_with_api(
     })
 }
 
-pub(crate) fn create_native_security_level_binder() -> Result<NativeBinder> {
-    create_native_binder_with_api(native_binder_api()?, NativeBinderKind::SecurityLevel)
+pub(crate) fn create_native_security_level_binder(
+    system_namespace_context: bool,
+) -> Result<NativeBinder> {
+    let kind = if system_namespace_context {
+        NativeBinderKind::SystemNamespaceSecurityLevel
+    } else {
+        NativeBinderKind::SecurityLevel
+    };
+    create_native_binder_with_api(native_binder_api()?, kind)
 }
 
 pub(crate) fn create_native_operation_binder() -> Result<NativeBinder> {
