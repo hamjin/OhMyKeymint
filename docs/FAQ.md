@@ -215,9 +215,11 @@ keybox that you use.
 
 OMK requires one complete EC entry and accepts an optional complete RSA entry.
 For any entry that is present, the private key must match its certificate
-chain. When an RSA entry is absent, RSA attestation uses the bundled AOSP RSA
-entry. The file must also be clean XML, without watermarks, comments inserted
-into key data, invisible characters, or other extra content.
+chain. When an RSA entry is absent, RSA attestation uses the EC private key and
+certificate chain from the same keybox. The attested key remains RSA; its
+certificate is signed with ECDSA. When both entries are present, RSA attestation
+uses the RSA entry. The file must also be clean XML, without watermarks, comments
+inserted into key data, invisible characters, or other extra content.
 
 A file working in another module does not prove that it is valid. Some other
 tools accept damaged or incomplete XML that OMK correctly rejects.

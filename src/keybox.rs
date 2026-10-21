@@ -55,7 +55,7 @@ pub struct CertSignAlgoInfo {
 
 #[derive(Clone)]
 pub struct KeyBox {
-    rsa_info: CertSignAlgoInfo,
+    rsa_info: Option<CertSignAlgoInfo>,
     ec_info: CertSignAlgoInfo,
     identity_digest: [u8; 32],
 }
@@ -102,12 +102,9 @@ impl KeyBox {
 
         let ec_entry = ec_entry.context("missing EC key entry in keybox.xml")?;
 
-        let rsa_info = rsa_entry
-            .map(Self::build_rsa_info)
-            .transpose()?
-            .unwrap_or_else(|| Self::new().rsa_info);
+        let rsa_info = rsa_entry.map(Self::build_rsa_info).transpose()?;
         let ec_info = Self::build_ec_info(ec_entry)?;
-        let identity_digest = Self::compute_identity_digest(&rsa_info, &ec_info)?;
+        let identity_digest = Self::compute_identity_digest(rsa_info.as_ref(), &ec_info)?;
 
         Ok(Self {
             rsa_info,
@@ -160,12 +157,14 @@ impl KeyBox {
     }
 
     fn compute_identity_digest(
-        rsa_info: &CertSignAlgoInfo,
+        rsa_info: Option<&CertSignAlgoInfo>,
         ec_info: &CertSignAlgoInfo,
     ) -> Result<[u8; 32]> {
         let mut material = Vec::new();
-        append_labeled_bytes(&mut material, b"rsa-key", &rsa_info.key_der);
-        append_labeled_chain(&mut material, b"rsa-chain", &rsa_info.chain);
+        if let Some(rsa_info) = rsa_info {
+            append_labeled_bytes(&mut material, b"rsa-key", &rsa_info.key_der);
+            append_labeled_chain(&mut material, b"rsa-chain", &rsa_info.chain);
+        }
         append_labeled_bytes(&mut material, b"ec-key", &ec_info.key_der);
         append_labeled_chain(&mut material, b"ec-chain", &ec_info.chain);
 
@@ -175,25 +174,13 @@ impl KeyBox {
     }
 
     fn refresh_identity_digest(&mut self) -> Result<()> {
-        self.identity_digest = Self::compute_identity_digest(&self.rsa_info, &self.ec_info)?;
+        self.identity_digest =
+            Self::compute_identity_digest(self.rsa_info.as_ref(), &self.ec_info)?;
         Ok(())
     }
 
     pub fn identity_digest(&self) -> [u8; 32] {
         self.identity_digest
-    }
-
-    fn signing_info(&self, key_type: SigningKeyType) -> Result<SigningInfoSnapshot, Error> {
-        let (signing_key, cert_chain) = match key_type.algo_hint {
-            SigningAlgorithm::Rsa => (&self.rsa_info.key, &self.rsa_info.chain),
-            SigningAlgorithm::Ec => (&self.ec_info.key, &self.ec_info.chain),
-        };
-
-        Ok(SigningInfoSnapshot {
-            signing_key: signing_key.clone(),
-            cert_chain: cert_chain.clone(),
-            identity_digest: self.identity_digest,
-        })
     }
 
     pub fn update_rsa_keybox(
@@ -227,7 +214,7 @@ impl KeyBox {
         };
         match algorithm {
             KeyAlgorithm::Ec => self.ec_info = Self::build_ec_info(entry)?,
-            KeyAlgorithm::Rsa => self.rsa_info = Self::build_rsa_info(entry)?,
+            KeyAlgorithm::Rsa => self.rsa_info = Some(Self::build_rsa_info(entry)?),
         }
         self.refresh_identity_digest()
     }
@@ -237,7 +224,7 @@ impl KeyBox {
             concat!(
                 "<?xml version=\"1.0\"?>\n",
                 "<AndroidAttestation>\n",
-                "<NumberOfKeyboxes>2</NumberOfKeyboxes>\n",
+                "<NumberOfKeyboxes>1</NumberOfKeyboxes>\n",
                 "<Keybox DeviceID=\"sw\">\n",
                 "{}\n",
                 "{}\n",
@@ -252,7 +239,10 @@ impl KeyBox {
     fn to_xml_block(&self, algorithm: KeyAlgorithm) -> String {
         let (name, private_label, info) = match algorithm {
             KeyAlgorithm::Ec => ("ecdsa", "EC PRIVATE KEY", &self.ec_info),
-            KeyAlgorithm::Rsa => ("rsa", "RSA PRIVATE KEY", &self.rsa_info),
+            KeyAlgorithm::Rsa => match &self.rsa_info {
+                Some(info) => ("rsa", "RSA PRIVATE KEY", info),
+                None => return String::new(),
+            },
         };
         let certificates = info
             .chain
@@ -288,6 +278,22 @@ impl KeyBox {
 impl Default for KeyBox {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl RetrieveCertSigningInfo for KeyBox {
+    fn signing_info(&self, key_type: SigningKeyType) -> Result<SigningInfoSnapshot, Error> {
+        let info = match key_type.algo_hint {
+            // The subject key algorithm is a preference, not a restriction on the issuer.
+            SigningAlgorithm::Rsa => self.rsa_info.as_ref().unwrap_or(&self.ec_info),
+            SigningAlgorithm::Ec => &self.ec_info,
+        };
+
+        Ok(SigningInfoSnapshot {
+            signing_key: info.key.clone(),
+            cert_chain: info.chain.clone(),
+            identity_digest: self.identity_digest,
+        })
     }
 }
 
@@ -671,7 +677,9 @@ pub(crate) fn signing_certificate_ders_from_disk() -> Result<[Vec<u8>; 2]> {
     let _io_guard = KEYBOX_IO_LOCK.lock().unwrap();
     let (keybox, _) = load_keybox_with_fallback(KEYBOX_PATH)?;
     Ok([
-        keybox.rsa_info.chain[0].encoded_certificate.clone(),
+        keybox.rsa_info.as_ref().unwrap_or(&keybox.ec_info).chain[0]
+            .encoded_certificate
+            .clone(),
         keybox.ec_info.chain[0].encoded_certificate.clone(),
     ])
 }
@@ -703,13 +711,106 @@ mod tests {
     fn parses_bundled_template() {
         let keybox = KeyBox::from_xml_str(BUNDLED_KEYBOX_XML).unwrap();
         assert_eq!(keybox.ec_info.chain.len(), 2);
-        assert_eq!(keybox.rsa_info.chain.len(), 2);
+        assert_eq!(keybox.rsa_info.as_ref().unwrap().chain.len(), 2);
         assert_ne!(keybox.identity_digest(), [0u8; 32]);
     }
 
     #[test]
     fn rejects_invalid_xml() {
         assert!(KeyBox::from_xml_str("<AndroidAttestation/>").is_err());
+    }
+
+    fn ec_only_keybox() -> KeyBox {
+        let xml = KEY_BLOCK_RE.replace_all(BUNDLED_KEYBOX_XML, |captures: &regex::Captures<'_>| {
+            if &captures[1] == "rsa" {
+                String::new()
+            } else {
+                captures[0].to_owned()
+            }
+        });
+        KeyBox::from_xml_str(&xml).unwrap()
+    }
+
+    #[test]
+    fn ec_only_keybox_signs_both_algorithms_with_ec() {
+        let keybox = ec_only_keybox();
+        assert!(keybox.rsa_info.is_none());
+        for which in [SigningKey::Batch, SigningKey::DeviceUnique] {
+            for algo_hint in [SigningAlgorithm::Rsa, SigningAlgorithm::Ec] {
+                let snapshot = keybox
+                    .signing_info(SigningKeyType { which, algo_hint })
+                    .unwrap();
+                assert!(matches!(snapshot.signing_key, KeyMaterial::Ec(_, _, _)));
+                assert_eq!(snapshot.cert_chain, keybox.ec_info.chain);
+                assert_eq!(snapshot.identity_digest, keybox.identity_digest());
+                validate_chain_matches_key(
+                    &snapshot.signing_key,
+                    &snapshot.cert_chain,
+                    KeyAlgorithm::Ec,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn ec_only_keybox_roundtrip_preserves_entries_and_identity() {
+        let keybox = ec_only_keybox();
+        let xml = keybox.to_xml_string();
+        assert!(!xml.contains("<Key algorithm=\"rsa\">"));
+        let reparsed = KeyBox::from_xml_str(&xml).unwrap();
+        assert!(reparsed.rsa_info.is_none());
+        assert_eq!(reparsed.ec_info.chain, keybox.ec_info.chain);
+        assert_eq!(reparsed.identity_digest(), keybox.identity_digest());
+        assert_ne!(keybox.identity_digest(), KeyBox::new().identity_digest());
+    }
+
+    #[test]
+    fn ec_only_keybox_update_refreshes_rsa_signing_snapshot() {
+        let mut keybox = ec_only_keybox();
+        let old_identity = keybox.identity_digest();
+        let mut chain = keybox.ec_info.chain.clone();
+        chain.push(chain.last().unwrap().clone());
+        keybox
+            .update_ec_keybox(keybox.ec_info.key_der.clone(), chain.clone())
+            .unwrap();
+        let snapshot = keybox
+            .signing_info(SigningKeyType {
+                which: SigningKey::Batch,
+                algo_hint: SigningAlgorithm::Rsa,
+            })
+            .unwrap();
+        assert_eq!(snapshot.cert_chain, chain);
+        assert_ne!(snapshot.identity_digest, old_identity);
+        assert_eq!(snapshot.identity_digest, keybox.identity_digest());
+        assert!(KeyBox::from_xml_str(&keybox.to_xml_string())
+            .unwrap()
+            .rsa_info
+            .is_none());
+    }
+
+    #[test]
+    fn adding_rsa_entry_restores_rsa_signing_and_identity() {
+        let mut keybox = ec_only_keybox();
+        let old_identity = keybox.identity_digest();
+        let bundled = KeyBox::new();
+        let rsa = bundled.rsa_info.as_ref().unwrap();
+        keybox
+            .update_rsa_keybox(rsa.key_der.clone(), rsa.chain.clone())
+            .unwrap();
+        let snapshot = keybox
+            .signing_info(SigningKeyType {
+                which: SigningKey::Batch,
+                algo_hint: SigningAlgorithm::Rsa,
+            })
+            .unwrap();
+        assert!(matches!(snapshot.signing_key, KeyMaterial::Rsa(_)));
+        assert_eq!(snapshot.cert_chain, rsa.chain);
+        assert_ne!(snapshot.identity_digest, old_identity);
+        assert_eq!(snapshot.identity_digest, bundled.identity_digest());
+        let reparsed = KeyBox::from_xml_str(&keybox.to_xml_string()).unwrap();
+        assert!(reparsed.rsa_info.is_some());
+        assert_eq!(reparsed.identity_digest(), bundled.identity_digest());
     }
 
     #[test]
@@ -726,8 +827,10 @@ mod tests {
     #[test]
     fn rejects_mismatched_private_key_and_certificate_chain() {
         let keybox = KeyBox::from_xml_str(BUNDLED_KEYBOX_XML).unwrap();
-        let rsa_cert =
-            encode_pem_block("CERTIFICATE", &keybox.rsa_info.chain[0].encoded_certificate);
+        let rsa_cert = encode_pem_block(
+            "CERTIFICATE",
+            &keybox.rsa_info.as_ref().unwrap().chain[0].encoded_certificate,
+        );
         let ec_cert = encode_pem_block("CERTIFICATE", &keybox.ec_info.chain[0].encoded_certificate);
         let modified_xml = BUNDLED_KEYBOX_XML.replacen(&rsa_cert, &ec_cert, 1);
         assert!(KeyBox::from_xml_str(&modified_xml).is_err());

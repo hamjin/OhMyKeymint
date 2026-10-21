@@ -1714,6 +1714,125 @@ mod tests {
     }
 
     #[test]
+    fn ec_only_keybox_attests_rsa_and_ec_keys() {
+        use der::{Decode, Encode};
+        use kmr_common::crypto::{ec, rsa};
+        use kmr_ta::device::{
+            RetrieveCertSigningInfo, SigningAlgorithm, SigningKey, SigningKeyType,
+        };
+        use kmr_wire::keymint as wire_keymint;
+
+        let xml = include_str!("../../template/keybox.xml");
+        let rsa_block = Regex::new(r#"(?s)<Key algorithm="rsa">.*?</Key>"#).unwrap();
+        let keybox = crate::keybox::KeyBox::from_xml_str(&rsa_block.replace_all(xml, "")).unwrap();
+        let signer = keybox
+            .signing_info(SigningKeyType {
+                which: SigningKey::Batch,
+                algo_hint: SigningAlgorithm::Ec,
+            })
+            .unwrap();
+        let issuer =
+            x509_cert::Certificate::from_der(&signer.cert_chain[0].encoded_certificate).unwrap();
+        let issuer_public_key = issuer.tbs_certificate().subject_public_key_info();
+
+        let mut ta = test_ta();
+        ta.set_sign_info(Some(Box::new(keybox)));
+        assert_eq!(set_boot_info(&mut ta), 0);
+        assert_eq!(
+            ta.process_req(PerformOpReq::SetHalInfo(SetHalInfoRequest {
+                os_version: 160000,
+                os_patchlevel: 202506,
+                vendor_patchlevel: 20250605,
+            }))
+            .error_code,
+            0
+        );
+
+        let challenge = b"ec-only-keybox-attestation";
+        for algorithm in [wire_keymint::Algorithm::Rsa, wire_keymint::Algorithm::Ec] {
+            for purpose in [
+                wire_keymint::KeyPurpose::Sign,
+                wire_keymint::KeyPurpose::AttestKey,
+            ] {
+                let mut key_params = vec![
+                    KeyParam::Algorithm(algorithm),
+                    KeyParam::Purpose(purpose),
+                    KeyParam::Digest(wire_keymint::Digest::Sha256),
+                    KeyParam::NoAuthRequired,
+                    KeyParam::AttestationChallenge(challenge.to_vec()),
+                    KeyParam::AttestationApplicationId(b"test-app".to_vec()),
+                    KeyParam::CertificateNotBefore(wire_keymint::UNDEFINED_NOT_BEFORE),
+                    KeyParam::CertificateNotAfter(wire_keymint::UNDEFINED_NOT_AFTER),
+                ];
+                let subject_oid = if algorithm == wire_keymint::Algorithm::Rsa {
+                    key_params.extend([
+                        KeyParam::KeySize(KeySizeInBits(2048)),
+                        KeyParam::RsaPublicExponent(RsaExponent(65537)),
+                        KeyParam::Padding(wire_keymint::PaddingMode::RsaPkcs1_1_5Sign),
+                    ]);
+                    rsa::X509_OID
+                } else {
+                    key_params.push(KeyParam::EcCurve(wire_keymint::EcCurve::P256));
+                    ec::X509_NIST_OID
+                };
+                let response =
+                    ta.process_req(PerformOpReq::DeviceGenerateKey(GenerateKeyRequest {
+                        key_params,
+                        attestation_key: None,
+                    }));
+                assert_eq!(response.error_code, 0, "{algorithm:?} {purpose:?}");
+                let generated = match response.rsp {
+                    Some(PerformOpRsp::DeviceGenerateKey(response)) => response.ret,
+                    response => panic!("unexpected generate response: {response:?}"),
+                };
+                assert!(generated.key_characteristics.iter().any(|chars| {
+                    chars
+                        .authorizations
+                        .contains(&KeyParam::Algorithm(algorithm))
+                }));
+                assert_eq!(generated.certificate_chain[1..], signer.cert_chain);
+                let leaf_der = &generated.certificate_chain[0].encoded_certificate;
+                let leaf = x509_cert::Certificate::from_der(leaf_der).unwrap();
+                assert_eq!(
+                    leaf.tbs_certificate()
+                        .subject_public_key_info()
+                        .algorithm
+                        .oid,
+                    subject_oid
+                );
+                assert_eq!(
+                    leaf.signature_algorithm().oid,
+                    ec::ECDSA_SHA256_SIGNATURE_OID
+                );
+                assert_eq!(
+                    leaf.tbs_certificate().signature(),
+                    leaf.signature_algorithm()
+                );
+                assert_eq!(
+                    leaf.tbs_certificate().issuer(),
+                    issuer.tbs_certificate().subject()
+                );
+                assert_eq!(
+                    crate::plat::attestation::extract_attestation_challenge_from_leaf_certificate(
+                        leaf_der
+                    )
+                    .unwrap(),
+                    challenge
+                );
+                ring::signature::UnparsedPublicKey::new(
+                    &ring::signature::ECDSA_P256_SHA256_ASN1,
+                    issuer_public_key.subject_public_key.as_bytes().unwrap(),
+                )
+                .verify(
+                    &leaf.tbs_certificate().to_der().unwrap(),
+                    leaf.signature().as_bytes().unwrap(),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn keymint_ta_early_boot_ended_rejects_late_boot_info() {
         let mut ta = test_ta();
         assert_eq!(set_boot_info(&mut ta), 0);
