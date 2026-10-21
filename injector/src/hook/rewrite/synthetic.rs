@@ -51,6 +51,7 @@ pub(in crate::hook) enum SyntheticReply {
     Parcel(Box<parcel::OwnedReply>),
     Status(i32),
     NoReply,
+    SystemSecurityLevel(crate::android::hardware::security::keymint::SecurityLevel::SecurityLevel),
 }
 
 #[derive(Clone, Debug)]

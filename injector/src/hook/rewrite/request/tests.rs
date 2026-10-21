@@ -9,6 +9,21 @@ use rsbinder::{Status, StatusCode};
 use std::mem::size_of;
 
 #[test]
+fn native_system_callers_use_the_configured_android_package_block() {
+    let cfg = config::InjectorConfig::default();
+    for (uid, sid) in [(0, "u:r:vold:s0"), (1000, "u:r:system_server:s0")] {
+        let caller = CallerInfo {
+            uid,
+            sid: sid.to_string(),
+            pid: 1458,
+        };
+        let decision = evaluate_caller(&caller, &cfg);
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, FilterReason::RejectedAndroidPackage);
+    }
+}
+
+#[test]
 fn omk_grant_blocker_preserves_inbound_binder_buffer() {
     let mut tr: binder_transaction_data = unsafe { std::mem::zeroed() };
     tr.code = service_tx::r#grant;
@@ -24,6 +39,160 @@ fn omk_grant_blocker_preserves_inbound_binder_buffer() {
     assert_eq!(tr.offsets_size, size_of::<usize>());
     assert_eq!(unsafe { tr.data.ptr.buffer }, 0x1000);
     assert_eq!(unsafe { tr.data.ptr.offsets }, 0x2000);
+}
+
+#[test]
+fn namespace_boundary_applies_to_all_service_key_and_listing_methods() {
+    for domain in [
+        Domain::APP,
+        Domain::KEY_ID,
+        Domain::GRANT,
+        Domain::SELINUX,
+        Domain::BLOB,
+        Domain(99),
+    ] {
+        for mut request in sample_service_requests() {
+            let has_namespace = match &mut request {
+                ParsedServiceRequest::GetKeyEntry { key }
+                | ParsedServiceRequest::UpdateSubcomponent { key, .. }
+                | ParsedServiceRequest::DeleteKey { key }
+                | ParsedServiceRequest::Grant { key, .. }
+                | ParsedServiceRequest::Ungrant { key, .. } => {
+                    key.domain = domain;
+                    true
+                }
+                ParsedServiceRequest::ListEntries { domain: target, .. }
+                | ParsedServiceRequest::GetNumberOfEntries { domain: target, .. }
+                | ParsedServiceRequest::ListEntriesBatched { domain: target, .. } => {
+                    *target = domain;
+                    true
+                }
+                _ => false,
+            };
+            let expected = if has_namespace && matches!(domain, Domain::SELINUX | Domain::BLOB) {
+                RouteTarget::System
+            } else {
+                RouteTarget::Omk
+            };
+            assert_eq!(
+                route_for_service_request(&request, &config::InterceptConfig::default()),
+                expected,
+                "method={:?} domain={domain:?}",
+                request.method()
+            );
+            assert_eq!(
+                route_for_service_request(&request, &disabled_intercept_config()),
+                RouteTarget::System
+            );
+        }
+    }
+}
+
+#[test]
+fn security_level_scope_uses_primary_namespace_and_keeps_secondary_descriptors_unchanged() {
+    for domain in [
+        Domain::APP,
+        Domain::KEY_ID,
+        Domain::GRANT,
+        Domain::SELINUX,
+        Domain::BLOB,
+        Domain(99),
+    ] {
+        let key = KeyDescriptor {
+            domain,
+            ..sample_key_descriptor()
+        };
+        let external = KeyDescriptor {
+            domain: Domain::SELINUX,
+            ..sample_key_descriptor()
+        };
+        let requests = [
+            ParsedSecurityLevelRequest::CreateOperation {
+                key: key.clone(),
+                operation_parameters: vec![],
+                forced: false,
+            },
+            ParsedSecurityLevelRequest::GenerateKey {
+                key: key.clone(),
+                attestation_key: Some(external.clone()),
+                params: vec![],
+                flags: 123,
+                entropy: vec![],
+            },
+            ParsedSecurityLevelRequest::ImportKey {
+                key: key.clone(),
+                attestation_key: Some(external.clone()),
+                params: vec![],
+                flags: 123,
+                key_data: vec![],
+            },
+            ParsedSecurityLevelRequest::ImportWrappedKey {
+                key: key.clone(),
+                wrapping_key: external,
+                masking_key: None,
+                params: vec![],
+                authenticators: vec![],
+            },
+            ParsedSecurityLevelRequest::ConvertStorageKeyToEphemeral {
+                storage_key: key.clone(),
+            },
+            ParsedSecurityLevelRequest::DeleteKey { key },
+        ];
+        for request in requests {
+            assert_eq!(
+                security_level_request_uses_system_namespace(&request),
+                matches!(domain, Domain::SELINUX | Domain::BLOB),
+                "{:?}",
+                request.method()
+            );
+        }
+    }
+}
+
+#[test]
+fn system_namespace_cannot_enter_omk_via_a_wrapping_key_grant() {
+    let caller = CallerInfo {
+        uid: 1000,
+        pid: 2957,
+        sid: "u:r:system_server:s0".into(),
+    };
+    let decision = filter::FilterDecision {
+        allowed: false,
+        reason: FilterReason::RejectedNotInScope,
+        packages: vec![],
+    };
+    let request = ParsedSecurityLevelRequest::ImportWrappedKey {
+        key: KeyDescriptor {
+            domain: Domain::SELINUX,
+            ..sample_key_descriptor()
+        },
+        wrapping_key: KeyDescriptor {
+            domain: Domain::GRANT,
+            ..sample_key_descriptor()
+        },
+        masking_key: None,
+        params: vec![],
+        authenticators: vec![],
+    };
+    assert!(!should_allow_omk_grant_security_level_request_with_probe(
+        &request,
+        &decision,
+        &caller,
+        |_, _| panic!("system namespaces must not probe OMK")
+    )
+    .unwrap());
+    assert!(!maintenance_requires_mirror(
+        &ParsedMaintenanceRequest::ClearNamespace {
+            domain: Domain::SELINUX,
+            nspace: 100
+        }
+    ));
+    assert!(maintenance_requires_mirror(
+        &ParsedMaintenanceRequest::ClearNamespace {
+            domain: Domain::APP,
+            nspace: 1000
+        }
+    ));
 }
 
 #[test]

@@ -294,7 +294,7 @@ unsafe fn build_synthetic_br_transaction_reply(
 
     let reply =
         build_synthetic_br_transaction_reply_inner(tr, target, info, caller_sid, command_name)?;
-    if expects_reply {
+    if expects_reply || matches!(reply, SyntheticReply::SystemSecurityLevel(_)) {
         Ok(reply)
     } else {
         Ok(SyntheticReply::NoReply)
@@ -372,7 +372,7 @@ unsafe fn build_synthetic_br_transaction_reply_inner(
     }
 
     let cfg = config::get();
-    if !cfg.main.enabled {
+    if !cfg.main.enabled && kind != SyntheticTargetKind::SecurityLevel {
         warn!(
             "event=synthetic injector disabled while synthetic target ptr=0x{:x} cookie=0x{:x} is still live; returning SYSTEM_ERROR",
             target.ptr, target.cookie
@@ -392,7 +392,6 @@ unsafe fn build_synthetic_br_transaction_reply_inner(
     };
     let caller = synthetic_transaction_caller(fallback, tr, caller_sid);
     if kind == SyntheticTargetKind::SecurityLevel {
-        let decision = evaluate_caller(&caller, &cfg);
         let request = match parcel::parse_security_level_request(
             data,
             data_size,
@@ -411,6 +410,23 @@ unsafe fn build_synthetic_br_transaction_reply_inner(
             }
         };
         let method = request.method();
+        if security_level_request_uses_system_namespace(&request) {
+            let target_info = tracker::lookup_security_level_target(target)
+                .ok_or_else(|| anyhow::anyhow!("missing synthetic security-level mapping"))?;
+            info!(
+                "event=synthetic routing system namespace {:?} uid={} pid={} to System",
+                method, caller.uid, caller.pid
+            );
+            return Ok(SyntheticReply::SystemSecurityLevel(
+                target_info.security_level,
+            ));
+        }
+        if !cfg.main.enabled {
+            return Ok(synthetic_parcel_reply(build_service_specific_reply(
+                ResponseCode::SYSTEM_ERROR.0,
+            )?));
+        }
+        let decision = evaluate_caller(&caller, &cfg);
         if decision.allowed && !security_level_scoop_enabled(&cfg.intercept) {
             warn!(
                 "event=synthetic security-level interception disabled while target ptr=0x{:x} cookie=0x{:x} is still live; returning SYSTEM_ERROR",

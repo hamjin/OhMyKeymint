@@ -524,6 +524,22 @@ unrecognized string does not make the TOML file invalid; the injector uses
 
 ### `[filter]`
 
+SELINUX and BLOB key namespaces are outside OMK interception. Requests for
+these primary namespaces, including listing, storage-key conversion, and
+namespace maintenance, stay on System even for a caller selected by `scoop`.
+This also applies when the caller uses a synthetic security-level handle:
+the injector forwards the original parcel through local System Binder objects
+inside keystore2, retaining the caller's identity and the System reply.
+An APP request's secondary attestation or wrapping key does not change its
+backend; OMK receives that descriptor unchanged.
+
+All callers, including `vold` and `system_server`, follow the same namespace
+boundary and configured package rules for APP, KEY_ID, and GRANT requests.
+There are no process-specific routing exclusions. Routing does not probe which
+backend created a key, and an OMK key-not-found error never triggers a System
+lookup. Authorization state and app maintenance state continue to be mirrored
+after successful System calls.
+
 With the filter enabled, OMK evaluates a caller in this order:
 
 1. Reject a core Android or system identity when
@@ -543,8 +559,8 @@ It does not override the Android-package block or `deny_packages`.
 #### `enabled`
 
 `true` enforces `scoop`, the deny list, the Android-package block, and the
-unknown-package policy. `false` bypasses all four checks and allows every
-caller to reach any operation enabled under `[intercept]`.
+unknown-package policy. `false` bypasses all four checks and allows every caller
+to reach enabled `[intercept]` operations within OMK's namespace scope.
 
 Disabling the filter can route Android services and unrelated apps to OMK and
 can break unlocking, app storage, or the user interface. Keep it `true`.
@@ -581,10 +597,11 @@ has confirmed that a supported app cannot be resolved normally.
 
 ### `[intercept]`
 
-Each switch controls one Android KeyStore service operation. For a caller
-allowed by the filter, `true` routes that operation to OMK and `false` leaves
-that operation on System. These switches do not migrate existing keys or make
-System-created key references usable by OMK.
+Each switch controls one Android KeyStore service operation within OMK's
+namespace scope. For a caller allowed by the filter, `true` routes that
+operation to OMK and `false` leaves it on System. SELINUX and BLOB primary
+namespaces always stay on System. These switches do not migrate existing keys
+or make System-created key references usable by OMK.
 
 The OMK-owned grant exception is separate from ordinary package routing. A
 request carrying a confirmed OMK grant may return to OMK even when the

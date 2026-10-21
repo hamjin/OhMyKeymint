@@ -15,7 +15,9 @@ fn route_for_service_request(
     request: &ParsedServiceRequest,
     intercept: &config::InterceptConfig,
 ) -> RouteTarget {
-    if identify::is_omk_service_route_enabled(request.method(), intercept) {
+    if !service_request_uses_system_namespace(request)
+        && identify::is_omk_service_route_enabled(request.method(), intercept)
+    {
         RouteTarget::Omk
     } else {
         RouteTarget::System
@@ -196,10 +198,16 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
 
         let method = request.method();
         let (route, packages, reason) = match &request {
-            ParsedMaintenanceRequest::MigrateKeyNamespace { .. } => {
+            ParsedMaintenanceRequest::MigrateKeyNamespace {
+                source,
+                destination,
+            } => {
                 let decision = evaluate_caller(&caller, &cfg);
                 (
-                    if decision.allowed {
+                    if decision.allowed
+                        && !is_system_namespace(source.domain)
+                        && !is_system_namespace(destination.domain)
+                    {
                         RouteTarget::Omk
                     } else {
                         RouteTarget::System
@@ -525,7 +533,9 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
         };
         // Keystore2 shares each security-level Binder between getSecurityLevel and getKeyEntry.
         let scoop_enabled = security_level_scoop_enabled(&cfg.intercept);
-        let route = if allow_unknown_omk_route || decision.allowed && scoop_enabled {
+        let route = if !security_level_request_uses_system_namespace(&request)
+            && (allow_unknown_omk_route || decision.allowed && scoop_enabled)
+        {
             RouteTarget::Omk
         } else {
             RouteTarget::System

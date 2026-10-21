@@ -83,18 +83,59 @@ fn unknown_package_policy_only_allows_app_uids() {
 }
 
 #[test]
-fn root_follows_android_package_policy() {
+fn root_and_system_follow_the_same_configured_filter_policy() {
+    for uid in [kmr_common::consts::AID_ROOT, kmr_common::consts::AID_SYSTEM] {
+        let mut config = base_config();
+        config.allow_unknown_package = true;
+
+        let decision = evaluate(&base_scope(), &config, uid, PackageResolution::Unknown);
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, FilterReason::RejectedAndroidPackage);
+
+        config.block_android_package = false;
+        let decision = evaluate(&base_scope(), &config, uid, PackageResolution::Unknown);
+        assert!(decision.allowed);
+        assert_eq!(decision.reason, FilterReason::Allowed);
+
+        config.allow_unknown_package = false;
+        let decision = evaluate(&base_scope(), &config, uid, PackageResolution::Unknown);
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, FilterReason::RejectedUnknownPackage);
+
+        config.enabled = false;
+        config.block_android_package = true;
+        let decision = evaluate(&base_scope(), &config, uid, PackageResolution::Unknown);
+        assert!(decision.allowed);
+        assert_eq!(decision.reason, FilterReason::Disabled);
+    }
+}
+
+#[test]
+fn shared_system_uid_packages_still_follow_configurable_filter_policy() {
     let mut config = base_config();
-    config.allow_unknown_package = true;
-
-    let decision = evaluate(&base_scope(), &config, 0, PackageResolution::Unknown);
-    assert!(!decision.allowed);
-    assert_eq!(decision.reason, FilterReason::RejectedAndroidPackage);
-
     config.block_android_package = false;
-    let decision = evaluate(&base_scope(), &config, 0, PackageResolution::Unknown);
+    let scope = vec!["android".to_string()];
+    let packages = vec!["android".to_string(), "com.android.systemui".to_string()];
+
+    // Shared UIDs follow the package match and deny-list precedence rules.
+    let decision = evaluate(
+        &scope,
+        &config,
+        kmr_common::consts::AID_SYSTEM,
+        PackageResolution::Known(packages.clone()),
+    );
     assert!(decision.allowed);
     assert_eq!(decision.reason, FilterReason::Allowed);
+
+    config.deny_packages = vec!["com.android.systemui".to_string()];
+    let decision = evaluate(
+        &scope,
+        &config,
+        kmr_common::consts::AID_SYSTEM,
+        PackageResolution::Known(packages),
+    );
+    assert!(!decision.allowed);
+    assert_eq!(decision.reason, FilterReason::RejectedByDenylist);
 }
 
 #[test]

@@ -185,6 +185,10 @@ pub(super) fn authorization_mirror_failure_policy(
 }
 
 pub(super) fn maintenance_requires_mirror(request: &ParsedMaintenanceRequest) -> bool {
+    if matches!(request, ParsedMaintenanceRequest::ClearNamespace { domain, .. } if is_system_namespace(*domain))
+    {
+        return false;
+    }
     !matches!(
         request,
         ParsedMaintenanceRequest::GetState { .. }

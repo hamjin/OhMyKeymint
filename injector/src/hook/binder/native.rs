@@ -335,17 +335,19 @@ unsafe fn native_binder_on_transact_inner(
     };
 
     let state = (api.ipc_thread_state_self)();
-    let (calling_sid, one_way) = if state.is_null() {
-        (None, false)
+    let (calling_sid, transaction_flags) = if state.is_null() {
+        (None, 0)
     } else {
         let sid = (api.ipc_thread_state_get_calling_sid)(state);
         let calling_sid =
             (!sid.is_null()).then(|| CStr::from_ptr(sid).to_string_lossy().into_owned());
-        let one_way = ((api.ipc_thread_state_get_last_transaction_binder_flags)(state)
-            & super::TF_ONE_WAY)
-            != 0;
-        (calling_sid, one_way)
+        // Strip driver-only flags such as TF_ACCEPT_FDS; preserve every flag
+        // accepted by AIBinder_transact, including sensitive-buffer clearing.
+        let flags = (api.ipc_thread_state_get_last_transaction_binder_flags)(state)
+            & (rsbinder::FLAG_ONEWAY | rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_VENDOR);
+        (calling_sid, flags)
     };
+    let one_way = transaction_flags & TF_ONE_WAY != 0;
 
     let output_platform = if one_way || output.is_null() {
         std::ptr::null_mut()
@@ -376,7 +378,7 @@ unsafe fn native_binder_on_transact_inner(
         target: binder_transaction_data_target { ptr: target.ptr },
         cookie: target.cookie,
         code,
-        flags: if one_way { TF_ONE_WAY } else { 0 },
+        flags: transaction_flags,
         sender_pid: (api.binder_get_calling_pid)(),
         sender_euid: (api.binder_get_calling_uid)() as i32,
         data_size: input_size,
@@ -400,7 +402,233 @@ unsafe fn native_binder_on_transact_inner(
     .unwrap_or(crate::hook::rewrite::SyntheticReply::Status(
         rsbinder::StatusCode::UnknownTransaction.into(),
     ));
+    if let crate::hook::rewrite::SyntheticReply::SystemSecurityLevel(level) = reply {
+        match forward_system_security_level(api, level.0, &tr, input_platform, output_platform) {
+            Ok(()) => return 0,
+            Err(error) => {
+                warn!(
+                    "failed to forward system namespace on native security-level Binder: {error:#}"
+                );
+                if one_way {
+                    return 0;
+                }
+                let status = rsbinder::Status::new_service_specific_error(
+                    crate::android::system::keystore2::ResponseCode::ResponseCode::SYSTEM_ERROR.0,
+                    None,
+                );
+                let reply = match crate::parcel::build_status_reply(&status) {
+                    Ok(reply) => crate::hook::rewrite::SyntheticReply::Parcel(Box::new(reply)),
+                    Err(_) => return rsbinder::StatusCode::Unknown.into(),
+                };
+                return write_native_binder_reply(api, output, output_platform, reply);
+            }
+        }
+    }
     write_native_binder_reply(api, output, output_platform, reply)
+}
+
+// All forwarding stays on local libbinder objects in keystore2. Calling out to
+// another process would replace the original caller identity with keystore2's.
+struct SystemForwardApi {
+    service_class: usize,
+    check_service: unsafe extern "C" fn(*const c_char) -> *mut c_void,
+    is_remote: unsafe extern "C" fn(*const c_void) -> bool,
+    get_class: unsafe extern "C" fn(*const c_void) -> *const c_void,
+    associate_class: unsafe extern "C" fn(*mut c_void, *const c_void) -> bool,
+    prepare: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32,
+    transact:
+        unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void, *mut *mut c_void, u32) -> i32,
+    write_int: unsafe extern "C" fn(*mut c_void, i32) -> i32,
+    read_status: unsafe extern "C" fn(*const c_void, *mut *mut c_void) -> i32,
+    status_is_ok: unsafe extern "C" fn(*const c_void) -> bool,
+    status_delete: unsafe extern "C" fn(*mut c_void),
+    read_binder: unsafe extern "C" fn(*const c_void, *mut *mut c_void) -> i32,
+    set_data_size: unsafe extern "C" fn(*mut c_void, usize) -> i32,
+    set_position: unsafe extern "C" fn(*const c_void, i32) -> i32,
+    append_from: unsafe extern "C" fn(*mut c_void, *const c_void, usize, usize) -> i32,
+}
+
+impl SystemForwardApi {
+    unsafe fn load() -> Result<Self> {
+        let ndk = open_library(b"libbinder_ndk.so\0")?;
+        let binder = open_library(b"libbinder.so\0")?;
+        let define: ClassDefine = load_symbol(ndk, b"AIBinder_Class_define\0")?;
+        let service_class = define(
+            c"android.system.keystore2.IKeystoreService".as_ptr(),
+            native_binder_on_create,
+            native_binder_on_destroy,
+            native_binder_on_transact,
+        );
+        if service_class.is_null() {
+            bail!("failed to define System keystore service class");
+        }
+        Ok(Self {
+            service_class: service_class as usize,
+            check_service: load_symbol(ndk, b"AServiceManager_checkService\0")?,
+            is_remote: load_symbol(ndk, b"AIBinder_isRemote\0")?,
+            get_class: load_symbol(ndk, b"AIBinder_getClass\0")?,
+            associate_class: load_symbol(ndk, b"AIBinder_associateClass\0")?,
+            prepare: load_symbol(ndk, b"AIBinder_prepareTransaction\0")?,
+            transact: load_symbol(ndk, b"AIBinder_transact\0")?,
+            write_int: load_symbol(ndk, b"AParcel_writeInt32\0")?,
+            read_status: load_symbol(ndk, b"AParcel_readStatusHeader\0")?,
+            status_is_ok: load_symbol(ndk, b"AStatus_isOk\0")?,
+            status_delete: load_symbol(ndk, b"AStatus_delete\0")?,
+            read_binder: load_symbol(ndk, b"AParcel_readStrongBinder\0")?,
+            set_data_size: load_symbol(binder, b"_ZN7android6Parcel11setDataSizeEm\0")?,
+            set_position: load_symbol(ndk, b"AParcel_setDataPosition\0")?,
+            append_from: load_symbol(binder, b"_ZN7android6Parcel10appendFromEPKS0_mm\0")?,
+        })
+    }
+
+    unsafe fn prepare_local(
+        &self,
+        api: &NativeBinderApi,
+        binder: &RawBinder,
+        class: usize,
+    ) -> Result<RawParcel> {
+        let ptr = binder.binder as *mut c_void;
+        if ptr.is_null() || (self.is_remote)(ptr) {
+            bail!("System Binder must be local to preserve the caller identity");
+        }
+        if (self.get_class)(ptr).is_null() && !(self.associate_class)(ptr, class as *const c_void) {
+            bail!("failed to associate System Binder interface");
+        }
+        let mut parcel = RawParcel {
+            parcel: std::ptr::null_mut(),
+            delete: api.parcel_delete,
+        };
+        check_forward_status((self.prepare)(ptr, &mut parcel.parcel))?;
+        Ok(parcel)
+    }
+
+    unsafe fn call(
+        &self,
+        api: &NativeBinderApi,
+        binder: &RawBinder,
+        request: &mut RawParcel,
+        code: u32,
+        flags: u32,
+    ) -> Result<RawParcel> {
+        let mut reply = RawParcel {
+            parcel: std::ptr::null_mut(),
+            delete: api.parcel_delete,
+        };
+        // AIBinder_transact consumes the request and clears its pointer, also on error.
+        check_forward_status((self.transact)(
+            binder.binder as *mut c_void,
+            code,
+            &mut request.parcel,
+            &mut reply.parcel,
+            flags,
+        ))?;
+        Ok(reply)
+    }
+}
+
+fn check_forward_status(status: i32) -> Result<()> {
+    if status != 0 {
+        return Err(rsbinder::StatusCode::from(status).into());
+    }
+    Ok(())
+}
+
+unsafe fn forward_system_security_level(
+    api: &NativeBinderApi,
+    level: i32,
+    tr: &binder_transaction_data,
+    input: *const c_void,
+    output: *mut c_void,
+) -> Result<()> {
+    static FORWARD_API: OnceLock<std::result::Result<SystemForwardApi, String>> = OnceLock::new();
+    let forward = FORWARD_API
+        .get_or_init(|| SystemForwardApi::load().map_err(|e| format!("{e:#}")))
+        .as_ref()
+        .map_err(|e| anyhow!("{e}"))?;
+    let _guard = crate::forward::BypassGuard::enter();
+    let service = RawBinder {
+        binder: (forward.check_service)(
+            c"android.system.keystore2.IKeystoreService/default".as_ptr(),
+        ) as usize,
+        dec_strong: api.binder_dec_strong,
+    };
+    forward_security_level_from_service(api, forward, &service, level, tr, input, output)
+}
+
+unsafe fn forward_security_level_from_service(
+    api: &NativeBinderApi,
+    forward: &SystemForwardApi,
+    service: &RawBinder,
+    level: i32,
+    tr: &binder_transaction_data,
+    input: *const c_void,
+    output: *mut c_void,
+) -> Result<()> {
+    let mut request = forward.prepare_local(api, service, forward.service_class)?;
+    check_forward_status((forward.write_int)(request.parcel, level))?;
+    let reply = forward.call(
+        api,
+        service,
+        &mut request,
+        crate::android::system::keystore2::IKeystoreService::transactions::r#getSecurityLevel,
+        0,
+    )?;
+    let mut status = std::ptr::null_mut();
+    check_forward_status((forward.read_status)(reply.parcel, &mut status))?;
+    if status.is_null() {
+        bail!("missing System getSecurityLevel status");
+    }
+    let ok = (forward.status_is_ok)(status);
+    (forward.status_delete)(status);
+    if !ok {
+        if !output.is_null() {
+            let platform =
+                api.view_platform_const(reply.parcel, service.binder as *const c_void, true);
+            if platform.is_null() {
+                bail!("missing System getSecurityLevel reply parcel");
+            }
+            check_forward_status((forward.append_from)(
+                output,
+                platform,
+                0,
+                (api.platform_parcel_data_size)(platform),
+            ))?;
+        }
+        return Ok(());
+    }
+    let mut binder = std::ptr::null_mut();
+    check_forward_status((forward.read_binder)(reply.parcel, &mut binder))?;
+    let backend = RawBinder {
+        binder: binder as usize,
+        dec_strong: api.binder_dec_strong,
+    };
+    let mut request = forward.prepare_local(api, &backend, api.security_level_class)?;
+    let platform = api.view_platform_mut(request.parcel, binder, true);
+    if platform.is_null() {
+        bail!("missing System security-level request parcel");
+    }
+    check_forward_status((forward.set_data_size)(platform, 0))?;
+    check_forward_status((forward.set_position)(request.parcel, 0))?;
+    check_forward_status((forward.append_from)(
+        platform,
+        input,
+        0,
+        (api.platform_parcel_data_size)(input),
+    ))?;
+    let reply = forward.call(api, &backend, &mut request, tr.code, tr.flags)?;
+    if !output.is_null() {
+        let platform = api.view_platform_const(reply.parcel, binder, true);
+        if platform.is_null() {
+            bail!("missing System security-level reply parcel");
+        }
+        check_forward_status((forward.append_from)(
+            output,
+            platform,
+            0,
+            (api.platform_parcel_data_size)(platform),
+        ))?;
+    }
+    Ok(())
 }
 
 unsafe fn write_platform_bytes(api: &NativeBinderApi, parcel: *mut c_void, bytes: &[u8]) -> i32 {
@@ -419,6 +647,9 @@ unsafe fn write_native_binder_reply(
     match reply {
         crate::hook::rewrite::SyntheticReply::Status(status) => status,
         crate::hook::rewrite::SyntheticReply::NoReply => 0,
+        crate::hook::rewrite::SyntheticReply::SystemSecurityLevel(_) => {
+            rsbinder::StatusCode::InvalidOperation.into()
+        }
         crate::hook::rewrite::SyntheticReply::Parcel(mut reply) => {
             if output.is_null() || output_platform.is_null() {
                 return rsbinder::StatusCode::BadValue.into();

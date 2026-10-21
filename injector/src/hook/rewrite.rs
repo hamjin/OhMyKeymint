@@ -121,6 +121,34 @@ fn service_request_key(request: &ParsedServiceRequest) -> Option<&KeyDescriptor>
     }
 }
 
+fn is_system_namespace(domain: Domain) -> bool {
+    matches!(domain, Domain::SELINUX | Domain::BLOB)
+}
+
+fn service_request_uses_system_namespace(request: &ParsedServiceRequest) -> bool {
+    match request {
+        ParsedServiceRequest::ListEntries { domain, .. }
+        | ParsedServiceRequest::GetNumberOfEntries { domain, .. }
+        | ParsedServiceRequest::ListEntriesBatched { domain, .. } => is_system_namespace(*domain),
+        _ => service_request_key(request).is_some_and(|key| is_system_namespace(key.domain)),
+    }
+}
+
+fn security_level_request_uses_system_namespace(request: &ParsedSecurityLevelRequest) -> bool {
+    // Only the request's destination/primary namespace determines scope. An APP
+    // request with an external attestation or wrapping key remains authoritative
+    // on OMK; those secondary descriptors are passed to it unchanged.
+    let key = match request {
+        ParsedSecurityLevelRequest::CreateOperation { key, .. }
+        | ParsedSecurityLevelRequest::GenerateKey { key, .. }
+        | ParsedSecurityLevelRequest::ImportKey { key, .. }
+        | ParsedSecurityLevelRequest::ImportWrappedKey { key, .. }
+        | ParsedSecurityLevelRequest::DeleteKey { key }
+        | ParsedSecurityLevelRequest::ConvertStorageKeyToEphemeral { storage_key: key } => key,
+    };
+    is_system_namespace(key.domain)
+}
+
 fn security_level_request_key(request: &ParsedSecurityLevelRequest) -> Option<&KeyDescriptor> {
     match request {
         ParsedSecurityLevelRequest::GenerateKey {
@@ -195,6 +223,9 @@ fn should_allow_omk_grant_security_level_request_with_probe(
     caller: &CallerInfo,
     mut probe: impl FnMut(&CallerInfo, &KeyDescriptor) -> anyhow::Result<bool>,
 ) -> anyhow::Result<bool> {
+    if security_level_request_uses_system_namespace(request) {
+        return Ok(false);
+    }
     let Some(grant) = security_level_request_key(request) else {
         return Ok(false);
     };
